@@ -3,7 +3,7 @@
 const fs = require("fs");
 const path = require("path");
 
-const IMAGE_PATH = path.join(__dirname, "..", "assets", "images_(2).jpeg");
+const IMAGE_PATH = path.join(__dirname, "..", "assets", "owner.jpeg");
 const BIRTH_DATE = new Date(2007, 8, 23);
 
 function calculateAge(birthDate, today = new Date()) {

@@ -2,7 +2,7 @@
 
 const { callGroupMemberAction } = require("./Bankai");
 
-const REMOVE_DELAY_MS = 1500;
+const CHECK_INTERVAL_MS = 3000;
 const FACEBOOK_USER_NAME = "Facebook User";
 
 function sleep(ms) {
@@ -21,9 +21,8 @@ function isUnnamed(name) {
   return trimmed === "" || trimmed === FACEBOOK_USER_NAME;
 }
 
-// يعتبر العضو معطلاً إذا لم يُرجع فيسبوك اسمه أو أرجع الاسم الافتراضي للحسابات المعطلة.
 // نرفض العمل إذا لم تصل أسماء الأعضاء أصلاً، حتى لا نزيل أعضاء فعليين بسبب بيانات ناقصة.
-function findDisabledMemberIDs(info, botID) {
+function readMemberData(info, botID) {
   if (!info || !Array.isArray(info.participantIDs) || !info.userInfo) {
     throw new Error("تعذر قراءة أسماء أعضاء المجموعة.");
   }
@@ -36,15 +35,17 @@ function findDisabledMemberIDs(info, botID) {
   );
   const adminIDs = new Set((info.adminIDs || []).map(normalizeID));
 
-  return info.participantIDs
+  const memberIDs = info.participantIDs
     .map((id) => String(id))
-    .filter(
-      (id) =>
-        id &&
-        id !== String(botID) &&
-        !adminIDs.has(id) &&
-        isUnnamed(namesByID.get(id)),
-    );
+    .filter((id) => id && id !== String(botID) && !adminIDs.has(id));
+
+  return { memberIDs, namesByID };
+}
+
+// يعتبر العضو معطلاً إذا لم يُرجع فيسبوك اسمه أو أرجع الاسم الافتراضي للحسابات المعطلة.
+function findDisabledMemberIDs(info, botID) {
+  const { memberIDs, namesByID } = readMemberData(info, botID);
+  return memberIDs.filter((id) => isUnnamed(namesByID.get(id)));
 }
 
 module.exports = {
@@ -62,33 +63,39 @@ module.exports = {
     }
 
     try {
-      await api.sendMessage("🔍 جاري فحص أعضاء المجموعة...", threadID);
-      const info = await api.getThreadInfo(threadID);
       const botID = api.getCurrentUserID ? api.getCurrentUserID() : "";
-      const disabledIDs = findDisabledMemberIDs(info, botID);
+      await api.sendMessage("🔍 جاري فحص أعضاء المجموعة حسابًا حسابًا...", threadID);
+      const { memberIDs } = readMemberData(
+        await api.getThreadInfo(threadID),
+        botID,
+      );
 
-      if (disabledIDs.length === 0) {
-        await api.sendMessage("✅ لا توجد حسابات معطلة في المجموعة.", threadID);
+      if (memberIDs.length === 0) {
+        await api.sendMessage("✅ لا يوجد أعضاء يمكن فحصهم في المجموعة.", threadID);
         return;
       }
 
-      await api.sendMessage(
-        `🧹 وجدت ${disabledIDs.length} حسابًا معطلًا، جاري إزالتها...`,
-        threadID,
-      );
-
       let removedCount = 0;
       let failedCount = 0;
-      for (let index = 0; index < disabledIDs.length; index++) {
-        const uid = disabledIDs[index];
+      for (let index = 0; index < memberIDs.length; index++) {
+        const uid = memberIDs[index];
         try {
-          await callGroupMemberAction(api, "remove", uid, threadID);
-          removedCount++;
+          const current = readMemberData(
+            await api.getThreadInfo(threadID),
+            botID,
+          );
+          if (
+            current.memberIDs.includes(uid) &&
+            isUnnamed(current.namesByID.get(uid))
+          ) {
+            await callGroupMemberAction(api, "remove", uid, threadID);
+            removedCount++;
+          }
         } catch (error) {
           failedCount++;
-          console.error(`[تنظيف] تعذرت إزالة ${uid}:`, error.message || error);
+          console.error(`[تنظيف] تعذر فحص أو إزالة ${uid}:`, error.message || error);
         }
-        if (index < disabledIDs.length - 1) await sleep(REMOVE_DELAY_MS);
+        if (index < memberIDs.length - 1) await sleep(CHECK_INTERVAL_MS);
       }
 
       console.log(
@@ -96,8 +103,8 @@ module.exports = {
       );
       await api.sendMessage(
         failedCount === 0
-          ? `✅ تمت إزالة ${removedCount} حسابًا معطلًا من المجموعة.`
-          : `⚠️ تمت إزالة ${removedCount} حسابًا معطلًا، وتعذرت إزالة ${failedCount}.`,
+          ? `✅ انتهى الفحص. تمت إزالة ${removedCount} حسابًا معطلًا من المجموعة.`
+          : `⚠️ انتهى الفحص. تمت إزالة ${removedCount} حسابًا معطلًا، وتعذر فحص أو إزالة ${failedCount}.`,
         threadID,
       );
     } catch (error) {
