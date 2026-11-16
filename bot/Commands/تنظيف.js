@@ -3,6 +3,7 @@
 const { callGroupMemberAction } = require("./Bankai");
 
 const CHECK_INTERVAL_MS = 3000;
+const RETRY_DELAY_MS = 1500;
 const FACEBOOK_USER_NAME = "Facebook User";
 
 function sleep(ms) {
@@ -21,37 +22,46 @@ function isUnnamed(name) {
   return trimmed === "" || trimmed === FACEBOOK_USER_NAME;
 }
 
-// نرفض العمل إذا لم تصل أسماء الأعضاء أصلاً، حتى لا نزيل أعضاء فعليين بسبب بيانات ناقصة.
-function readMemberData(info, botID) {
-  if (!info || !Array.isArray(info.participantIDs) || !info.userInfo) {
-    throw new Error("تعذر قراءة أسماء أعضاء المجموعة.");
+function listReviewableMemberIDs(info, botID) {
+  if (!info || !Array.isArray(info.participantIDs)) {
+    throw new Error("تعذر قراءة أعضاء المجموعة.");
   }
-
-  const entries = Array.isArray(info.userInfo)
-    ? info.userInfo.map((user) => [normalizeID(user), user])
-    : Object.entries(info.userInfo);
-  const namesByID = new Map(
-    entries.map(([id, user]) => [String(id), user && user.name]),
-  );
   const adminIDs = new Set((info.adminIDs || []).map(normalizeID));
-
-  const memberIDs = info.participantIDs
+  return info.participantIDs
     .map((id) => String(id))
     .filter((id) => id && id !== String(botID) && !adminIDs.has(id));
-
-  return { memberIDs, namesByID };
 }
 
-// يعتبر العضو معطلاً إذا لم يُرجع فيسبوك اسمه أو أرجع الاسم الافتراضي للحسابات المعطلة.
-function findDisabledMemberIDs(info, botID) {
-  const { memberIDs, namesByID } = readMemberData(info, botID);
-  return memberIDs.filter((id) => isUnnamed(namesByID.get(id)));
+function isGhostProfile(profiles, uid) {
+  const profile = profiles && profiles[uid];
+  return !profile || isUnnamed(profile.name);
+}
+
+function lookupUserInfo(api, uid) {
+  return new Promise((resolve, reject) => {
+    const pending = api.getUserInfo(uid, (error, data) =>
+      error ? reject(error) : resolve(data),
+    );
+    if (pending && typeof pending.then === "function") {
+      pending.then(resolve, reject);
+    }
+  });
+}
+
+async function fetchProfile(api, uid) {
+  try {
+    return await lookupUserInfo(api, uid);
+  } catch {
+    await sleep(RETRY_DELAY_MS);
+    return lookupUserInfo(api, uid);
+  }
 }
 
 module.exports = {
   name: "تنظيف",
 
-  findDisabledMemberIDs,
+  isGhostProfile,
+  listReviewableMemberIDs,
 
   async execute(api, event) {
     const threadID = String(event.threadID || "");
@@ -64,8 +74,8 @@ module.exports = {
 
     try {
       const botID = api.getCurrentUserID ? api.getCurrentUserID() : "";
-      await api.sendMessage("🔍 جاري فحص أعضاء المجموعة حسابًا حسابًا...", threadID);
-      const { memberIDs } = readMemberData(
+      await api.sendMessage("🔍 جاري فحص حسابات أعضاء المجموعة واحدًا واحدًا...", threadID);
+      const memberIDs = listReviewableMemberIDs(
         await api.getThreadInfo(threadID),
         botID,
       );
@@ -79,22 +89,23 @@ module.exports = {
       let failedCount = 0;
       for (let index = 0; index < memberIDs.length; index++) {
         const uid = memberIDs[index];
+        let profiles = null;
         try {
-          const current = readMemberData(
-            await api.getThreadInfo(threadID),
-            botID,
-          );
-          if (
-            current.memberIDs.includes(uid) &&
-            isUnnamed(current.namesByID.get(uid))
-          ) {
+          profiles = await fetchProfile(api, uid);
+        } catch (error) {
+          console.error(`[تنظيف] تعذر الوصول إلى حساب ${uid}:`, error.message || error);
+        }
+
+        if (!profiles || isGhostProfile(profiles, uid)) {
+          try {
             await callGroupMemberAction(api, "remove", uid, threadID);
             removedCount++;
+          } catch (error) {
+            failedCount++;
+            console.error(`[تنظيف] تعذرت إزالة ${uid}:`, error.message || error);
           }
-        } catch (error) {
-          failedCount++;
-          console.error(`[تنظيف] تعذر فحص أو إزالة ${uid}:`, error.message || error);
         }
+
         if (index < memberIDs.length - 1) await sleep(CHECK_INTERVAL_MS);
       }
 
@@ -104,7 +115,7 @@ module.exports = {
       await api.sendMessage(
         failedCount === 0
           ? `✅ انتهى الفحص. تمت إزالة ${removedCount} حسابًا معطلًا من المجموعة.`
-          : `⚠️ انتهى الفحص. تمت إزالة ${removedCount} حسابًا معطلًا، وتعذر فحص أو إزالة ${failedCount}.`,
+          : `⚠️ انتهى الفحص. تمت إزالة ${removedCount} حسابًا معطلًا، وتعذرت إزالة ${failedCount}.`,
         threadID,
       );
     } catch (error) {
