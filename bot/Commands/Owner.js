@@ -42,8 +42,6 @@ module.exports = {
           attachment: fs.createReadStream(IMAGE_PATH),
         },
         threadID,
-        undefined,
-        event.messageID,
       );
     } catch (e) {
       console.error("[Owner] تعذر إرسال معلومات المالك:", e.message || e);
